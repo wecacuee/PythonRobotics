@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from random import random
 from functools import partial
+from collections import namedtuple
 
 # simulation parameters
 Kp_rho = 9
@@ -22,60 +23,114 @@ dt = 0.01
 
 show_animation = True
 
+
+PolarState = np.ndarray
+CartesianState = np.ndarray
+
+
+def polar2cartesian(x: PolarState, state_goal : CartesianState) -> CartesianState:
+    rho, alpha, beta = x
+    x_goal, y_goal, theta_goal = state_goal
+    phi = angdiff(theta_goal, beta)
+    x_diff = rho * np.cos(phi)
+    y_diff = rho * np.sin(phi)
+    theta = normalize_angle(alpha + phi)
+    return np.array([x_goal - x_diff,
+                     y_goal - y_diff,
+                     theta])
+
+
+def cartesian2polar(state: CartesianState, state_goal : CartesianState) -> PolarState:
+    x, y, theta = state
+    x_goal, y_goal, theta_goal = state_goal
+
+    x_diff = x_goal - x
+    y_diff = y_goal - y
+
+    # reparameterization
+    rho = np.hypot(x_diff, y_diff)
+    phi = np.arctan2(y_diff, x_diff)
+    alpha = angdiff(phi , theta)
+    beta = angdiff(theta_goal , phi)
+    return np.array((rho, alpha, beta))
+
+
+
 class PolarDynamics:
-    def f(self, x):
+    def f(self, x : PolarState):
         return np.zeros_like(x)
 
-    def g(self, x):
+    def g(self, x : PolarState):
         rho, alpha, beta = x
         return (np.array([[-np.cos(alpha), 0],
                           [np.sin(alpha)/rho, -1],
                           [-np.sin(alpha)/rho, 0]])
-                if rho > 1e-6 else
+                if (rho > 1e-2) else
                 np.array([[-1, 0],
                           [1, -1],
                           [-1, 0]]))
 
 class CartesianDynamics:
-    def f(self, x):
+    def f(self, x : CartesianState):
         return np.zeros_like(x)
 
-    def g(self, state):
+    def g(self, state: CartesianState):
         x, y, theta = state
         return np.array([[np.cos(theta), 0],
                          [np.sin(theta), 0],
                          [0, 1]])
 
 
-def angdiff(thetap, theta):
-    return ((thetap - theta) + np.pi) % (2 * np.pi) - np.pi
+def normalize_angle(theta):
+    # Restrict alpha and beta (angle differences) to the range
+    # [-pi, pi] to prevent unstable behavior e.g. difference going
+    # from 0 rad to 2*pi rad with slight turn
+    return (theta + np.pi) % (2 * np.pi) - np.pi
 
-def cosdiff(thetap, theta):
-    up = np.array([np.cos(thetap), np.sin(thetap)])
-    u = np.array([np.cos(theta), np.sin(theta)])
-    return 1 - up @ up
+def angdiff(thetap, theta):
+    return normalize_angle(thetap - theta)
+
+
+def cosdist(thetap, theta):
+    return 1 - np.cos(thetap - theta)
+
 
 class ControllerCLF:
     """
     Aicardi, M., Casalino, G., Bicchi, A., & Balestrino, A. (1995). Closed loop steering of unicycle like vehicles via Lyapunov techniques. IEEE Robotics & Automation Magazine, 2(1), 27-35.
     """
     def __init__(self, # simulation parameters
-                 Kp = [1, 2, 1],
+                 Kp = np.array([9, 15, 5])/10.,
                  u_dim = 2,
                  dynamics = PolarDynamics()):
         self.Kp = np.asarray(Kp)
         self.u_dim = 2
         self.dynamics = dynamics
 
-    def _clf(self, x, u):
-        return 0.5 * (self.Kp @ (x*x))
+    def _clf_terms(self, x):
+        rho, alpha, beta = x
+        return np.array((0.5 * self.Kp[0] * rho ** 2,
+                         self.Kp[1] * cosdist(alpha, 0),
+                         self.Kp[2] * cosdist(alpha, beta)
+        ))
 
-    def _grad_clf(self, x, u):
-        return self.Kp * x
+    def _clf(self, x):
+        return self._clf_terms(x).sum()
+
+    def _grad_clf(self, x):
+        rho, alpha, beta = x
+        return np.array((self.Kp[0] * rho ,
+                         self.Kp[1] * np.sin(alpha) + self.Kp[2] * np.sin(alpha - beta) ,
+                         - self.Kp[2] * np.sin(alpha - beta)))
 
     def _clc(self, x, u):
         f, g = self.dynamics.f, self.dynamics.g
-        return self._grad_clf(x, u) @ (f(x) + g(x) @ u) + self._clf(x, u)
+        gclf = self._grad_clf(x)
+        print("x :", x)
+        print("clf terms :", self._clf_terms(x))
+        print("grad_x clf:", gclf)
+        print("grad_u clf:", gclf @ g(x))
+        return gclf @ (f(x) + g(x) @ u) + 10*self._clf(x)
 
     def _cost(self, x, u):
         import cvxpy as cp # pip install cvxpy
@@ -87,9 +142,9 @@ class ControllerCLF:
         uvar = cp.Variable(self.u_dim)
         uvar.value = np.zeros(self.u_dim)
         relax = cp.Variable(1)
-        obj = cp.Minimize(self._cost(x, uvar) + 100 * relax**2)
-        constr = (self._clc(x, uvar) + relax <= 0)
-        problem = cp.Problem(obj, [constr])
+        obj = cp.Minimize(self._cost(x, uvar) + 10*self._clc(x, uvar))
+        #constr = (self._clc(x, uvar) + relax <= 0)
+        problem = cp.Problem(obj)#, [constr])
         problem.solve(solver='GUROBI')
         if problem.status not in ["infeasible", "unbounded"]:
             # Otherwise, problem.value is inf or -inf, respectively.
@@ -99,8 +154,7 @@ class ControllerCLF:
             raise ValueError(problem.status)
         # for variable in problem.variables():
         #     print("Variable %s: value %s" % (variable.name(), variable.value))
-        [v,w] = uvar.value
-        return v,w
+        return uvar.value
 
 
 class ControllerPID:
@@ -116,6 +170,8 @@ class ControllerPID:
         rho, alpha, beta = x
         v = Kp_rho * rho
         w = Kp_alpha * alpha + Kp_beta * beta
+        if alpha > np.pi / 2 or alpha < -np.pi / 2:
+            v = -v
         return [v, w]
 
 
@@ -144,24 +200,11 @@ def move_to_pose(x_start, y_start, theta_start, x_goal, y_goal, theta_goal,
         x_traj.append(x)
         y_traj.append(y)
 
-        x_diff = x_goal - x
-        y_diff = y_goal - y
-
-        # Restrict alpha and beta (angle differences) to the range
-        # [-pi, pi] to prevent unstable behavior e.g. difference going
-        # from 0 rad to 2*pi rad with slight turn
-
-        # reparameterization
-        rho = np.hypot(x_diff, y_diff)
-        phi = np.arctan2(y_diff, x_diff)
-        alpha = angdiff(phi - theta)
-        beta = angdiff(theta_goal - phi)
-
+        state = cartesian2polar(np.array([x, y, theta]),
+                                np.array([x_goal, y_goal, theta_goal]))
+        rho, alpha, beta = state
         # control
-        v, w = controller.control([rho, alpha, beta], t=count)
-
-        if alpha > np.pi / 2 or alpha < -np.pi / 2:
-            v = -v
+        v, w = controller.control(state, t=count)
 
         # simulation
         theta = theta + w * dt
@@ -215,11 +258,12 @@ def transformation_matrix(x, y, theta):
 
 
 def main():
-
     move_to_pose_configured = partial(move_to_pose,
                                       controller=ControllerCLF(
                                           dynamics=PolarDynamics()
                                       ))
+    # move_to_pose_configured = partial(move_to_pose,
+    #                                   controller=ControllerPID())
     for i in range(5):
         x_start = 20 * random()
         y_start = 20 * random()

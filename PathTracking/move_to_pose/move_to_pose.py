@@ -14,21 +14,17 @@ import numpy as np
 from random import random
 from functools import partial
 from collections import namedtuple
+import sys
 
 # simulation parameters
-Kp_rho = 9
-Kp_alpha = 15
-Kp_beta = -3
-dt = 0.01
 
-show_animation = True
-
-
-PolarState = np.ndarray
-CartesianState = np.ndarray
+PolarState = namedtuple('PolarState', 'rho alpha beta')
+CartesianState = namedtuple('CartesianState', 'x y theta')
 
 
 def polar2cartesian(x: PolarState, state_goal : CartesianState) -> CartesianState:
+    """
+    """
     rho, alpha, beta = x
     x_goal, y_goal, theta_goal = state_goal
     phi = angdiff(theta_goal, beta)
@@ -65,7 +61,7 @@ class PolarDynamics:
         return (np.array([[-np.cos(alpha), 0],
                           [np.sin(alpha)/rho, -1],
                           [-np.sin(alpha)/rho, 0]])
-                if (rho > 1e-2) else
+                if (rho > 1e-6) else
                 np.array([[-1, 0],
                           [1, -1],
                           [-1, 0]]))
@@ -95,54 +91,161 @@ def cosdist(thetap, theta):
     return 1 - np.cos(thetap - theta)
 
 
+class CLFPolar:
+    def __init__(self,
+                 Kp = np.array([9, 15, 5, 5])/10.):
+        self.Kp = np.asarray(Kp)
+
+    def clf_terms(self, x, x_goal):
+        rho, alpha, beta = cartesian2polar(x, x_goal)
+        return self._clf_terms(rho, alpha,beta)
+
+    def _clf_terms(self, rho, alpha, beta):
+        return np.array((0.5 * self.Kp[0] * rho ** 2,
+                         self.Kp[1] * (1-np.cos(alpha)),
+                         self.Kp[2] * (1-np.cos(beta)),
+                         self.Kp[3] * (1-np.cos(alpha - beta))
+        ))
+
+    def grad_clf(self, x, x_goal):
+        rho, alpha, beta = cartesian2polar(x, x_goal)
+        return self._grad_clf(rho, alpha, beta)
+
+    def _grad_clf(self, rho, alpha, beta):
+        """
+        >>> self = CLFPolar()
+        >>> x0 = np.random.rand(3)
+        >>> ajac = self._grad_clf(*x0)
+        >>> njac = numerical_jac(lambda x: self._clf_terms(*x).sum(), x0, 1e-6)[0]
+        >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
+        """
+        return np.array((self.Kp[0] * rho ,
+                         self.Kp[1] * np.sin(alpha)
+                         +  self.Kp[3] * np.sin(alpha - beta) ,
+                         self.Kp[2] * np.sin(beta)
+                         - self.Kp[3] * np.sin(alpha - beta)))
+
+    def isconverged(self, x, x_goal):
+        rho, alpha, beta = cartesian2polar(x, x_goal)
+        return rho < 1e-3
+
+
+def numerical_jac(func, x0, eps):
+    """
+    >>> def func(x): return np.array([np.cos(x[0]), np.sin(x[1])])
+    >>> def jacfunc(x): return np.array([[-np.sin(x[0]), 0], [0, np.cos(x[1])]])
+    >>> x0 = np.random.rand(2)
+    >>> njac = numerical_jac(func, x0, 1e-6)
+    >>> ajac = jacfunc(x0)
+    >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
+    """
+    f0 = func(x0)
+    m = 1 if np.isscalar(f0) else f0.shape[-1]
+    jac = np.empty((m, x0.shape[-1]))
+    Dx = eps * np.eye(x0.shape[-1])
+    XpDx = x0 + Dx
+    for c in range(x0.shape[-1]):
+        jac[:, c:c+1] = (func(XpDx[c, :]).reshape(-1, 1) - f0.reshape(-1, 1)) / eps
+
+    return jac
+
+
+class CLFCartesian:
+    def __init__(self,
+                 Kp = np.array([9, 15, 5])/10.):
+        self.Kp = np.asarray(Kp)
+
+    def clf_terms(self, state, state_goal):
+        rho, alpha, beta = cartesian2polar(state, state_goal)
+        x,y, theta = state
+        x_goal, y_goal, theta_goal = state_goal
+        return np.array((0.5 * self.Kp[0] * rho ** 2,
+                         self.Kp[1] * cosdist(alpha, 0),
+                         self.Kp[2] * cosdist(theta_goal, theta)
+        ))
+
+    def _grad_clf_terms(self, state, state_goal):
+        """
+        >>> self = CLFCartesian()
+        >>> x0 = np.random.rand(3)
+        >>> x0_goal = np.random.rand(3)
+        >>> ajac = self._grad_clf_terms(x0, x0_goal)[:, 0]
+        >>> njac = numerical_jac(lambda x: self.clf_terms(x, x0_goal)[0], x0, 1e-6)[0]
+        >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
+        >>> ajac = self._grad_clf_terms(x0, x0_goal)[:, 1]
+        >>> njac = numerical_jac(lambda x: self.clf_terms(x, x0_goal)[1], x0, 1e-6)[0]
+        >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
+        >>> ajac = self._grad_clf_terms(x0, x0_goal)[:, 2]
+        >>> njac = numerical_jac(lambda x: self.clf_terms(x, x0_goal)[2], x0, 1e-6)[0]
+        >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
+        """
+        x_diff, y_diff, theta_diff = state_goal - state
+        rho, alpha, beta = cartesian2polar(state, state_goal)
+        return np.array([[- self.Kp[0] * x_diff,
+                          self.Kp[1] * np.sin(alpha) * y_diff / (rho**2),
+                          0],
+                         [- self.Kp[0] * y_diff,
+                          - self.Kp[1] * np.sin(alpha) * x_diff / (rho**2),
+                         0],
+                         [0,
+                          -self.Kp[1] * np.sin(alpha),
+                          - self.Kp[2] * np.sin(theta_diff)]
+                         ])
+    def grad_clf(self, state, state_goal):
+        """
+        >>> self = CLFCartesian()
+        >>> x0 = np.random.rand(3)
+        >>> x0_goal = np.random.rand(3)
+        >>> ajac = self.grad_clf(x0, x0_goal)
+        >>> njac = numerical_jac(lambda x: self.clf_terms(x, x0_goal).sum(), x0, 1e-6)[0]
+        >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
+        """
+        return self._grad_clf_terms(state, state_goal).sum(axis=-1)
+
+    def isconverged(self, x, x_goal):
+        rho, alpha, beta = cartesian2polar(x, x_goal)
+        return rho < 1e-3
+
+
 class ControllerCLF:
     """
     Aicardi, M., Casalino, G., Bicchi, A., & Balestrino, A. (1995). Closed loop steering of unicycle like vehicles via Lyapunov techniques. IEEE Robotics & Automation Magazine, 2(1), 27-35.
     """
     def __init__(self, # simulation parameters
-                 Kp = np.array([9, 15, 5])/10.,
                  u_dim = 2,
-                 dynamics = PolarDynamics()):
-        self.Kp = np.asarray(Kp)
+                 dynamics = PolarDynamics(),
+                 clf = CLFPolar()):
         self.u_dim = 2
         self.dynamics = dynamics
+        self.clf = clf
 
-    def _clf_terms(self, x):
-        rho, alpha, beta = x
-        return np.array((0.5 * self.Kp[0] * rho ** 2,
-                         self.Kp[1] * cosdist(alpha, 0),
-                         self.Kp[2] * cosdist(alpha, beta)
-        ))
+    def _clf(self, x, x_goal):
+        return self.clf.clf_terms(x, x_goal).sum()
 
-    def _clf(self, x):
-        return self._clf_terms(x).sum()
+    def _grad_clf(self, x, x_goal):
+        return self.clf.grad_clf(x, x_goal)
 
-    def _grad_clf(self, x):
-        rho, alpha, beta = x
-        return np.array((self.Kp[0] * rho ,
-                         self.Kp[1] * np.sin(alpha) + self.Kp[2] * np.sin(alpha - beta) ,
-                         - self.Kp[2] * np.sin(alpha - beta)))
-
-    def _clc(self, x, u):
+    def _clc(self, x, x_goal, u):
         f, g = self.dynamics.f, self.dynamics.g
-        gclf = self._grad_clf(x)
+        gclf = self._grad_clf(x, x_goal)
         print("x :", x)
-        print("clf terms :", self._clf_terms(x))
+        print("clf terms :", self.clf.clf_terms(x, x_goal))
         print("grad_x clf:", gclf)
+        print("g(x): ", g(x))
         print("grad_u clf:", gclf @ g(x))
-        return gclf @ (f(x) + g(x) @ u) + 10*self._clf(x)
+        return gclf @ (f(x) + g(x) @ u) + 10*self._clf(x, x_goal)
 
     def _cost(self, x, u):
         import cvxpy as cp # pip install cvxpy
         return cp.sum_squares(u)
 
-    def control(self, x, t):
+    def control(self, x, x_goal, t):
         import cvxpy as cp # pip install cvxpy
         x = np.asarray(x)
         uvar = cp.Variable(self.u_dim)
         uvar.value = np.zeros(self.u_dim)
         relax = cp.Variable(1)
-        obj = cp.Minimize(self._cost(x, uvar) + 10*self._clc(x, uvar))
+        obj = cp.Minimize(self._cost(x, uvar) + 10*self._clc(x, x_goal, uvar))
         #constr = (self._clc(x, uvar) + relax <= 0)
         problem = cp.Problem(obj)#, [constr])
         problem.solve(solver='GUROBI')
@@ -157,6 +260,10 @@ class ControllerCLF:
         return uvar.value
 
 
+    def isconverged(self, state, state_goal):
+        return self.clf.isconverged(state, state_goal)
+
+
 class ControllerPID:
     def __init__(self, # simulation parameters
                  Kp_rho = 9,
@@ -166,16 +273,25 @@ class ControllerPID:
         self.Kp_alpha = Kp_alpha
         self.Kp_beta = Kp_beta
 
-    def control(self, x, t):
-        rho, alpha, beta = x
+    def control(self, x, x_goal, t):
+        rho, alpha, beta = cartesian2polar(x, x_goal)
+        Kp_rho   = self.Kp_rho
+        Kp_alpha = self.Kp_alpha
+        Kp_beta  = self.Kp_beta
         v = Kp_rho * rho
         w = Kp_alpha * alpha + Kp_beta * beta
         if alpha > np.pi / 2 or alpha < -np.pi / 2:
             v = -v
         return [v, w]
 
+    def isconverged(self, x, x_goal):
+        rho, alpha, beta = cartesian2polar(x, x_goal)
+        return rho < 1e-3
+
 
 def move_to_pose(x_start, y_start, theta_start, x_goal, y_goal, theta_goal,
+                 dt = 0.01,
+                 show_animation = True,
                  controller=ControllerCLF()):
     """
     rho is the distance between the robot and the goal position
@@ -189,27 +305,24 @@ def move_to_pose(x_start, y_start, theta_start, x_goal, y_goal, theta_goal,
     y = y_start
     theta = theta_start
 
-    x_diff = x_goal - x
-    y_diff = y_goal - y
-
     x_traj, y_traj = [], []
 
-    rho = np.hypot(x_diff, y_diff)
+    state = np.array([x, y, theta])
+    state_goal = np.array([x_goal, y_goal, theta_goal])
     count = 0
-    while rho > 0.001:
+    while not controller.isconverged(state, state_goal):
         x_traj.append(x)
         y_traj.append(y)
 
-        state = cartesian2polar(np.array([x, y, theta]),
-                                np.array([x_goal, y_goal, theta_goal]))
-        rho, alpha, beta = state
         # control
-        v, w = controller.control(state, t=count)
+        v, w = controller.control(state, state_goal, t=count)
 
         # simulation
         theta = theta + w * dt
         x = x + v * np.cos(theta) * dt
         y = y + v * np.sin(theta) * dt
+
+        state = np.array([x, y, theta])
 
         # visualization
         if show_animation:  # pragma: no cover
@@ -218,11 +331,11 @@ def move_to_pose(x_start, y_start, theta_start, x_goal, y_goal, theta_goal,
                       np.sin(theta_start), color='r', width=0.1)
             plt.arrow(x_goal, y_goal, np.cos(theta_goal),
                       np.sin(theta_goal), color='g', width=0.1)
-            plot_vehicle(x, y, theta, x_traj, y_traj)
+            plot_vehicle(x, y, theta, x_traj, y_traj, dt)
         count = count + 1
 
 
-def plot_vehicle(x, y, theta, x_traj, y_traj):  # pragma: no cover
+def plot_vehicle(x, y, theta, x_traj, y_traj, dt):  # pragma: no cover
     # Corners of triangular vehicle when pointing to the right (0 radians)
     p1_i = np.array([0.5, 0, 1]).T
     p2_i = np.array([-0.5, 0.25, 1]).T
@@ -241,10 +354,10 @@ def plot_vehicle(x, y, theta, x_traj, y_traj):  # pragma: no cover
 
     # for stopping simulation with the esc key.
     plt.gcf().canvas.mpl_connect('key_release_event',
-            lambda event: [exit(0) if event.key == 'escape' else None])
+            lambda event: [sys.exit(0) if event.key == 'escape' else None])
 
-    plt.xlim(0, 20)
-    plt.ylim(0, 20)
+    plt.xlim(-2, 22)
+    plt.ylim(-2, 22)
 
     plt.pause(dt)
 
@@ -257,13 +370,30 @@ def transformation_matrix(x, y, theta):
     ])
 
 
-def main():
-    move_to_pose_configured = partial(move_to_pose,
+class Configs:
+    @property
+    def clf_polar(self):
+        return dict(simulator=partial(move_to_pose,
                                       controller=ControllerCLF(
-                                          dynamics=PolarDynamics()
-                                      ))
-    # move_to_pose_configured = partial(move_to_pose,
-    #                                   controller=ControllerPID())
+                                          dynamics=PolarDynamics(),
+                                          clf = CLFPolar()
+                                      )))
+
+    @property
+    def clf_cartesian(self):
+        return dict(simulator=partial(move_to_pose,
+                                      controller=ControllerCLF(
+                                          dynamics=CartesianDynamics(),
+                                          clf = CLFCartesian()
+                                      )))
+
+    @property
+    def pid(self):
+        return dict(simulator=partial(move_to_pose,
+                                      controller=ControllerPID()))
+
+
+def main(simulator = move_to_pose):
     for i in range(5):
         x_start = 20 * random()
         y_start = 20 * random()
@@ -275,9 +405,11 @@ def main():
               (x_start, y_start, theta_start))
         print("Goal x: %.2f m\nGoal y: %.2f m\nGoal theta: %.2f rad\n" %
               (x_goal, y_goal, theta_goal))
-        move_to_pose_configured(x_start, y_start, theta_start, x_goal, y_goal,
+        simulator(x_start, y_start, theta_start, x_goal, y_goal,
                                 theta_goal)
 
 
 if __name__ == '__main__':
-    main()
+    import doctest
+    doctest.testmod()
+    #main(**getattr(Configs(), 'clf_polar')) # 'pid', 'clf_polar' or 'clf_cartesian'

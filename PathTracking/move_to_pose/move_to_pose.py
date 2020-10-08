@@ -8,6 +8,7 @@ Author: Daniel Ingram (daniel-s-ingram)
 P. I. Corke, "Robotics, Vision & Control", Springer 2017, ISBN 978-3-319-54413-7
 
 """
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,28 +16,51 @@ from random import random
 from functools import partial
 from collections import namedtuple
 import sys
+from torch.utils.tensorboard import SummaryWriter
 
 # simulation parameters
 
 PolarState = namedtuple('PolarState', 'rho alpha beta')
 CartesianState = namedtuple('CartesianState', 'x y theta')
 
+LOG = SummaryWriter('data/runs/' + datetime.now().strftime("%m%d-%H%M"))
+
 
 def polar2cartesian(x: PolarState, state_goal : CartesianState) -> CartesianState:
     """
+    rho is the distance between the robot and the goal position
+    alpha is the angle to the goal relative to the heading of the robot
+    beta is the angle between the robot's position and the goal position plus the goal angle
+
+    >>> polar = np.random.rand(3) * np.array([1, 2*np.pi, 2*np.pi]) - np.array([0, np.pi, np.pi])
+    >>> state_goal = np.random.rand(3) * np.array([2, 2, 2*np.pi]) - np.array([1, 1, np.pi])
+    >>> state = polar2cartesian(polar, state_goal)
+    >>> polarp = cartesian2polar(state, state_goal)
+    >>> np.testing.assert_allclose(polar, polarp)
     """
     rho, alpha, beta = x
     x_goal, y_goal, theta_goal = state_goal
     phi = angdiff(theta_goal, beta)
     x_diff = rho * np.cos(phi)
     y_diff = rho * np.sin(phi)
-    theta = normalize_angle(alpha + phi)
+    theta = angdiff(phi, alpha)
     return np.array([x_goal - x_diff,
                      y_goal - y_diff,
                      theta])
 
 
 def cartesian2polar(state: CartesianState, state_goal : CartesianState) -> PolarState:
+    """
+    rho is the distance between the robot and the goal position
+    alpha is the angle to the goal relative to the heading of the robot
+    beta is the angle between the robot's position and the goal position plus the goal angle
+
+    >>> state = np.random.rand(3)* np.array([2, 2, 2*np.pi]) - np.array([1, 1, np.pi])
+    >>> state_goal = np.random.rand(3)* np.array([2, 2, 2*np.pi]) - np.array([1, 1, np.pi])
+    >>> polar = cartesian2polar(state, state_goal)
+    >>> statep = polar2cartesian(polar, state_goal)
+    >>> np.testing.assert_allclose(state, statep)
+    """
     x, y, theta = state
     x_goal, y_goal, theta_goal = state_goal
 
@@ -93,7 +117,7 @@ def cosdist(thetap, theta):
 
 class CLFPolar:
     def __init__(self,
-                 Kp = np.array([9, 15, 5, 5])/10.):
+                 Kp = np.array([9, 15, 5])/10.):
         self.Kp = np.asarray(Kp)
 
     def clf_terms(self, x, x_goal):
@@ -103,27 +127,25 @@ class CLFPolar:
     def _clf_terms(self, rho, alpha, beta):
         return np.array((0.5 * self.Kp[0] * rho ** 2,
                          self.Kp[1] * (1-np.cos(alpha)),
-                         self.Kp[2] * (1-np.cos(beta)),
-                         self.Kp[3] * (1-np.cos(alpha - beta))
+                         self.Kp[2] * (1-np.cos(alpha - beta))
         ))
 
     def grad_clf(self, x, x_goal):
         rho, alpha, beta = cartesian2polar(x, x_goal)
-        return self._grad_clf(rho, alpha, beta)
+        return self._grad_clf_terms(rho, alpha, beta).sum(axis=-1)
 
-    def _grad_clf(self, rho, alpha, beta):
+    def _grad_clf_terms(self, rho, alpha, beta):
         """
         >>> self = CLFPolar()
         >>> x0 = np.random.rand(3)
-        >>> ajac = self._grad_clf(*x0)
+        >>> ajac = self._grad_clf_terms(*x0).sum(axis=-1)
         >>> njac = numerical_jac(lambda x: self._clf_terms(*x).sum(), x0, 1e-6)[0]
         >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
         """
-        return np.array((self.Kp[0] * rho ,
-                         self.Kp[1] * np.sin(alpha)
-                         +  self.Kp[3] * np.sin(alpha - beta) ,
-                         self.Kp[2] * np.sin(beta)
-                         - self.Kp[3] * np.sin(alpha - beta)))
+        return np.array([[self.Kp[0] * rho,  0, 0],
+                         [0, self.Kp[1] * np.sin(alpha),
+                          self.Kp[2] * np.sin(alpha - beta)] ,
+                         [0,  0, - self.Kp[2] * np.sin(alpha - beta)]])
 
     def isconverged(self, x, x_goal):
         rho, alpha, beta = cartesian2polar(x, x_goal)
@@ -225,9 +247,10 @@ class ControllerCLF:
     def _grad_clf(self, x, x_goal):
         return self.clf.grad_clf(x, x_goal)
 
-    def _clc(self, x, x_goal, u):
+    def _clc(self, x, x_goal, u, t):
         f, g = self.dynamics.f, self.dynamics.g
         gclf = self._grad_clf(x, x_goal)
+        LOG.add_scalar("x_0", x[0], t)
         print("x :", x)
         print("clf terms :", self.clf.clf_terms(x, x_goal))
         print("grad_x clf:", gclf)
@@ -245,7 +268,7 @@ class ControllerCLF:
         uvar = cp.Variable(self.u_dim)
         uvar.value = np.zeros(self.u_dim)
         relax = cp.Variable(1)
-        obj = cp.Minimize(self._cost(x, uvar) + 10*self._clc(x, x_goal, uvar))
+        obj = cp.Minimize(self._cost(x, uvar) + 10*self._clc(x, x_goal, uvar, t))
         #constr = (self._clc(x, uvar) + relax <= 0)
         problem = cp.Problem(obj)#, [constr])
         problem.solve(solver='GUROBI')

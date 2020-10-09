@@ -90,6 +90,18 @@ class PolarDynamics:
                           [1, -1],
                           [-1, 0]]))
 
+class CartesianDynamicsWrapper:
+    def __init__(self, x_goal, polar_dynamics = PolarDynamics()):
+        self.x_goal = x_goal
+        self.polar_dynamics = polar_dynamics
+
+    def f(self, x):
+        return polar2cartesian(self.polar_dynamics.f(cartesian2polar(x, self.x_goal)))
+
+    def g(self, x):
+        return polar2cartesian(self.polar_dynamics.g(cartesian2polar(x, self.x_goal)))
+
+
 class CartesianDynamics:
     def f(self, x : CartesianState):
         return np.zeros_like(x)
@@ -120,28 +132,28 @@ class CLFPolar:
                  Kp = np.array([9, 15, 5])/10.):
         self.Kp = np.asarray(Kp)
 
-    def clf_terms(self, x, x_goal):
-        rho, alpha, beta = cartesian2polar(x, x_goal)
-        return self._clf_terms(rho, alpha,beta)
+    def clf_terms(self, polar):
+        return self._clf_terms(polar)
 
-    def _clf_terms(self, rho, alpha, beta):
+    def _clf_terms(self, polar):
+        rho, alpha, beta = polar
         return np.array((0.5 * self.Kp[0] * rho ** 2,
                          self.Kp[1] * (1-np.cos(alpha)),
                          self.Kp[2] * (1-np.cos(alpha - beta))
         ))
 
-    def grad_clf(self, x, x_goal):
-        rho, alpha, beta = cartesian2polar(x, x_goal)
-        return self._grad_clf_terms(rho, alpha, beta).sum(axis=-1)
+    def grad_clf(self, polar):
+        return self._grad_clf_terms(polar).sum(axis=-1)
 
-    def _grad_clf_terms(self, rho, alpha, beta):
+    def _grad_clf_terms(self, polar):
         """
         >>> self = CLFPolar()
         >>> x0 = np.random.rand(3)
-        >>> ajac = self._grad_clf_terms(*x0).sum(axis=-1)
-        >>> njac = numerical_jac(lambda x: self._clf_terms(*x).sum(), x0, 1e-6)[0]
+        >>> ajac = self._grad_clf_terms(x0).sum(axis=-1)
+        >>> njac = numerical_jac(lambda x: self._clf_terms(x).sum(), x0, 1e-6)[0]
         >>> np.testing.assert_allclose(njac, ajac, rtol=1e-3, atol=1e-4)
         """
+        rho, alpha, beta = polar
         return np.array([[self.Kp[0] * rho,  0, 0],
                          [0, self.Kp[1] * np.sin(alpha),
                           self.Kp[2] * np.sin(alpha - beta)] ,
@@ -235,28 +247,32 @@ class ControllerCLF:
     """
     def __init__(self, # simulation parameters
                  u_dim = 2,
+                 coordinate_converter = cartesian2polar,
                  dynamics = PolarDynamics(),
                  clf = CLFPolar()):
         self.u_dim = 2
+        self.coordinate_converter = coordinate_converter
         self.dynamics = dynamics
         self.clf = clf
 
-    def _clf(self, x, x_goal):
-        return self.clf.clf_terms(x, x_goal).sum()
+    def _clf(self, polar):
+        return self.clf.clf_terms(polar).sum()
 
-    def _grad_clf(self, x, x_goal):
-        return self.clf.grad_clf(x, x_goal)
+    def _grad_clf(self, polar):
+        return self.clf.grad_clf(polar)
 
     def _clc(self, x, x_goal, u, t):
+        polar = self.coordinate_converter(x, x_goal)
         f, g = self.dynamics.f, self.dynamics.g
-        gclf = self._grad_clf(x, x_goal)
+        gclf = self._grad_clf(polar)
         LOG.add_scalar("x_0", x[0], t)
         print("x :", x)
-        print("clf terms :", self.clf.clf_terms(x, x_goal))
+        print("clf terms :", self.clf.clf_terms(polar))
+        print("clf:", self.clf.clf_terms(polar).sum())
         print("grad_x clf:", gclf)
-        print("g(x): ", g(x))
-        print("grad_u clf:", gclf @ g(x))
-        return gclf @ (f(x) + g(x) @ u) + 10*self._clf(x, x_goal)
+        print("g(x): ", g(polar))
+        print("grad_u clf:", gclf @ g(polar))
+        return gclf @ (f(polar) + g(polar) @ u) + 10 * self._clf(polar)
 
     def _cost(self, x, u):
         import cvxpy as cp # pip install cvxpy
@@ -312,10 +328,11 @@ class ControllerPID:
         return rho < 1e-3
 
 
-def move_to_pose(x_start, y_start, theta_start, x_goal, y_goal, theta_goal,
+def move_to_pose(state_start, state_goal,
                  dt = 0.01,
                  show_animation = True,
-                 controller=ControllerCLF()):
+                 controller=ControllerCLF(),
+                 dynamics=CartesianDynamics()):
     """
     rho is the distance between the robot and the goal position
     alpha is the angle to the goal relative to the heading of the robot
@@ -324,34 +341,29 @@ def move_to_pose(x_start, y_start, theta_start, x_goal, y_goal, theta_goal,
     Kp_rho*rho and Kp_alpha*alpha drive the robot along a line towards the goal
     Kp_beta*beta rotates the line so that it is parallel to the goal angle
     """
-    x = x_start
-    y = y_start
-    theta = theta_start
 
     x_traj, y_traj = [], []
 
-    state = np.array([x, y, theta])
-    state_goal = np.array([x_goal, y_goal, theta_goal])
+    state = state_start.copy()
     count = 0
     while not controller.isconverged(state, state_goal):
+        x, y, theta = state
         x_traj.append(x)
         y_traj.append(y)
 
         # control
-        v, w = controller.control(state, state_goal, t=count)
+        ctrl = controller.control(state, state_goal, t=count)
 
         # simulation
-        theta = theta + w * dt
-        x = x + v * np.cos(theta) * dt
-        y = y + v * np.sin(theta) * dt
-
-        state = np.array([x, y, theta])
+        state = state + (dynamics.f(state) + dynamics.g(state) @ ctrl) * dt
 
         # visualization
         if show_animation:  # pragma: no cover
             plt.cla()
+            x_start, y_start, theta_start = state_start
             plt.arrow(x_start, y_start, np.cos(theta_start),
                       np.sin(theta_start), color='r', width=0.1)
+            x_goal, y_goal, theta_goal = state_goal
             plt.arrow(x_goal, y_goal, np.cos(theta_goal),
                       np.sin(theta_goal), color='g', width=0.1)
             plot_vehicle(x, y, theta, x_traj, y_traj, dt)
@@ -396,15 +408,21 @@ def transformation_matrix(x, y, theta):
 class Configs:
     @property
     def clf_polar(self):
-        return dict(simulator=partial(move_to_pose,
-                                      controller=ControllerCLF(
-                                          dynamics=PolarDynamics(),
-                                          clf = CLFPolar()
-                                      )))
+        return dict(simulator=partial(
+            lambda x, x_g, **kw: move_to_pose(
+                x , x_g,
+                dynamics=CartesianDynamics(),
+                **kw),
+            controller=ControllerCLF(
+                coordinate_converter = cartesian2polar,
+                dynamics=PolarDynamics(),
+                clf = CLFPolar()
+            )))
 
     @property
     def clf_cartesian(self):
         return dict(simulator=partial(move_to_pose,
+                                      dynamics=CartesianDynamics(),
                                       controller=ControllerCLF(
                                           dynamics=CartesianDynamics(),
                                           clf = CLFCartesian()
@@ -413,6 +431,7 @@ class Configs:
     @property
     def pid(self):
         return dict(simulator=partial(move_to_pose,
+                                      dynamics=CartesianDynamics(),
                                       controller=ControllerPID()))
 
 
@@ -428,11 +447,11 @@ def main(simulator = move_to_pose):
               (x_start, y_start, theta_start))
         print("Goal x: %.2f m\nGoal y: %.2f m\nGoal theta: %.2f rad\n" %
               (x_goal, y_goal, theta_goal))
-        simulator(x_start, y_start, theta_start, x_goal, y_goal,
-                                theta_goal)
+        simulator(np.array([x_start, y_start, theta_start]),
+                  np.array([x_goal, y_goal, theta_goal]))
 
 
 if __name__ == '__main__':
     import doctest
     doctest.testmod()
-    #main(**getattr(Configs(), 'clf_polar')) # 'pid', 'clf_polar' or 'clf_cartesian'
+    main(**getattr(Configs(), 'clf_polar')) # 'pid', 'clf_polar' or 'clf_cartesian'
